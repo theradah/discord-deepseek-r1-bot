@@ -15,7 +15,19 @@ const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY || '').trim();
 const DEEPSEEK_BASE_URL = (process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com')
   .trim()
   .replace(/\/+$/, '');
-const DEFAULT_MODEL = (process.env.DEEPSEEK_MODEL || 'deepseek-reasoner').trim();
+
+function normalizeModel(rawModel) {
+  const m = (rawModel || '').trim();
+  if (!m || m === 'deepseek-reasoner') return 'deepseek-flash';
+  if (m === 'deepseek-chat') return 'deepseek-flash';
+  return m;
+}
+
+const DEFAULT_MODEL = normalizeModel(process.env.DEEPSEEK_MODEL || 'deepseek-flash');
+const DEFAULT_REASONING_EFFORT = (
+  process.env.DEEPSEEK_REASONING_EFFORT ||
+  (process.env.DEEPSEEK_MODEL === 'deepseek-chat' ? 'none' : 'high')
+).trim();
 const SYSTEM_PROMPT =
   (process.env.SYSTEM_PROMPT || '').trim() ||
   'You are a helpful, concise, and intelligent AI assistant on Discord powered by DeepSeek.';
@@ -55,11 +67,12 @@ function appendHistory(key, userContent, assistantContent) {
 }
 
 // --- DeepSeek API Client ---
-async function queryDeepSeek(prompt, historyKey, modelOverride) {
+async function queryDeepSeek(prompt, historyKey, modelOverride, effortOverride) {
   const history = conversationHistory.get(historyKey) || [];
-  const model = modelOverride || DEFAULT_MODEL;
+  const model = normalizeModel(modelOverride || DEFAULT_MODEL);
+  const reasoningEffort = effortOverride || DEFAULT_REASONING_EFFORT;
 
-  // Build strictly alternating messages for compatibility with deepseek-reasoner
+  // Build strictly alternating messages
   const messages = [{ role: 'system', content: SYSTEM_PROMPT }];
   for (const msg of history) {
     const prev = messages[messages.length - 1];
@@ -78,17 +91,20 @@ async function queryDeepSeek(prompt, historyKey, modelOverride) {
   }
 
   const endpoint = `${DEEPSEEK_BASE_URL}/chat/completions`;
+  const payload = {
+    model,
+    messages,
+    reasoning_effort: reasoningEffort,
+    stream: false,
+  };
+
   const response = await fetch(endpoint, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
     },
-    body: JSON.stringify({
-      model,
-      messages,
-      stream: false,
-    }),
+    body: JSON.stringify(payload),
   });
 
   if (!response.ok) {
@@ -165,11 +181,23 @@ const slashCommands = [
     .addStringOption((opt) =>
       opt
         .setName('model')
-        .setDescription('Choose DeepSeek model for this prompt')
+        .setDescription('Choose DeepSeek V4 model for this prompt')
         .setRequired(false)
         .addChoices(
-          { name: 'DeepSeek R1 (deepseek-reasoner)', value: 'deepseek-reasoner' },
-          { name: 'DeepSeek V3 (deepseek-chat)', value: 'deepseek-chat' }
+          { name: 'DeepSeek V4.1 Flash (deepseek-flash)', value: 'deepseek-flash' },
+          { name: 'DeepSeek V4 Pro (deepseek-v4-pro)', value: 'deepseek-v4-pro' }
+        )
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName('thinking')
+        .setDescription('Reasoning effort level (default: high)')
+        .setRequired(false)
+        .addChoices(
+          { name: 'None (Fast / Non-thinking)', value: 'none' },
+          { name: 'Low', value: 'low' },
+          { name: 'High (Default)', value: 'high' },
+          { name: 'Max', value: 'max' }
         )
     ),
   new SlashCommandBuilder()
@@ -181,8 +209,8 @@ const slashCommands = [
         .setDescription('Model name')
         .setRequired(true)
         .addChoices(
-          { name: 'DeepSeek R1 (deepseek-reasoner)', value: 'deepseek-reasoner' },
-          { name: 'DeepSeek V3 (deepseek-chat)', value: 'deepseek-chat' }
+          { name: 'DeepSeek V4.1 Flash (deepseek-flash)', value: 'deepseek-flash' },
+          { name: 'DeepSeek V4 Pro (deepseek-v4-pro)', value: 'deepseek-v4-pro' }
         )
     ),
   new SlashCommandBuilder()
@@ -250,10 +278,11 @@ function createBotClient(includeMessageContentIntent = true) {
       const prompt = interaction.options.getString('prompt', true);
       const modelChoice =
         interaction.options.getString('model', false) || getModel(interaction.channelId);
+      const thinkingChoice = interaction.options.getString('thinking', false) || undefined;
 
       await interaction.deferReply();
       try {
-        const result = await queryDeepSeek(prompt, historyKey, modelChoice);
+        const result = await queryDeepSeek(prompt, historyKey, modelChoice, thinkingChoice);
         const formatted = formatResponse(result);
         const chunks = splitMessage(formatted);
 
