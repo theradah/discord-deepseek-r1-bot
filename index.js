@@ -1,7 +1,9 @@
 require('dotenv').config();
 const {
   Client,
+  Events,
   GatewayIntentBits,
+  MessageFlags,
   Partials,
   REST,
   Routes,
@@ -28,9 +30,14 @@ const DEFAULT_REASONING_EFFORT = (
   process.env.DEEPSEEK_REASONING_EFFORT ||
   (process.env.DEEPSEEK_MODEL === 'deepseek-chat' ? 'none' : 'high')
 ).trim();
-const SYSTEM_PROMPT =
+const BASE_SYSTEM_PROMPT =
   (process.env.SYSTEM_PROMPT || '').trim() ||
   'You are Ruth, a helpful, concise, and intelligent AI assistant on Discord running directly on the official DeepSeek API (api.deepseek.com). You are a DeepSeek model created by DeepSeek (never claim to be Claude or Anthropic). You have access to live web_search and read_url tools—use them whenever the user asks you to Google, search the web, verify current facts, or check a website.';
+
+function getSystemPrompt() {
+  const nowStr = new Date().toISOString().split('T')[0];
+  return `${BASE_SYSTEM_PROMPT}\nToday's real current date is ${nowStr} (year 2026). Dates in 2025 and 2026 on websites are real, current dates—not a simulation.`;
+}
 
 const MAX_HISTORY_TURNS = 10;
 const DISCORD_MAX_LEN = 1900;
@@ -78,6 +85,25 @@ function decodeHtmlEntities(str) {
 }
 
 async function performWebSearch(query) {
+  // 1. Try Jina Web Search reader first (works reliably from cloud datacenter IPs)
+  try {
+    const jinaSearchUrl = `https://s.jina.ai/${encodeURIComponent(query)}`;
+    const jinaRes = await fetch(jinaSearchUrl, {
+      headers: {
+        Accept: 'text/plain',
+        'X-Retain-Images': 'none',
+        'User-Agent': 'Discord-DeepSeek-Bot/1.0',
+      },
+    });
+    if (jinaRes.ok) {
+      const text = (await jinaRes.text()).trim();
+      if (text && text.length > 80 && !text.startsWith('{"data":null')) {
+        return text.slice(0, 10000);
+      }
+    }
+  } catch (_) {}
+
+  // 2. Try DuckDuckGo HTML search with tolerant regexes
   try {
     const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
     const res = await fetch(url, {
@@ -89,32 +115,56 @@ async function performWebSearch(query) {
     const html = await res.text();
 
     const results = [];
-    const blockRegex =
-      /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
-    let match;
-    while ((match = blockRegex.exec(html)) !== null && results.length < 6) {
-      let href = match[1];
+    const linkRegex = /<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    const snippetRegex = /<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
+
+    const links = [];
+    let m;
+    while ((m = linkRegex.exec(html)) !== null && links.length < 8) {
+      let href = m[1];
       const uddgMatch = href.match(/[?&]uddg=([^&]+)/);
-      if (uddgMatch) {
-        href = decodeURIComponent(uddgMatch[1]);
-      }
-      const title = decodeHtmlEntities(match[2].replace(/<[^>]+>/g, '').trim());
-      const snippet = decodeHtmlEntities(match[3].replace(/<[^>]+>/g, '').trim());
-      if (title && href) {
-        results.push({ title, url: href, snippet });
+      if (uddgMatch) href = decodeURIComponent(uddgMatch[1]);
+      const title = decodeHtmlEntities(m[2].replace(/<[^>]+>/g, '').trim());
+      links.push({ title, url: href });
+    }
+
+    const snippets = [];
+    while ((m = snippetRegex.exec(html)) !== null && snippets.length < 8) {
+      snippets.push(decodeHtmlEntities(m[1].replace(/<[^>]+>/g, '').trim()));
+    }
+
+    for (let i = 0; i < links.length; i++) {
+      if (links[i].title && links[i].url) {
+        results.push({
+          title: links[i].title,
+          url: links[i].url,
+          snippet: snippets[i] || '',
+        });
       }
     }
 
-    if (results.length === 0) {
-      return `No direct search results found for "${query}".`;
+    if (results.length > 0) {
+      return results
+        .map((r, i) => `[${i + 1}] ${r.title}\nURL: ${r.url}\nSnippet: ${r.snippet}`)
+        .join('\n\n');
     }
+  } catch (_) {}
 
-    return results
-      .map((r, i) => `[${i + 1}] ${r.title}\nURL: ${r.url}\nSnippet: ${r.snippet}`)
-      .join('\n\n');
+  // 3. Fallback: Read DuckDuckGo Lite via Jina Reader
+  try {
+    const ddgJina = `https://r.jina.ai/https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
+    const res = await fetch(ddgJina, {
+      headers: { Accept: 'text/plain', 'User-Agent': 'Discord-DeepSeek-Bot/1.0' },
+    });
+    if (res.ok) {
+      const text = (await res.text()).trim();
+      if (text.length > 50) return text.slice(0, 10000);
+    }
   } catch (err) {
     return `Web search error: ${err.message}`;
   }
+
+  return `No search results found for "${query}". Try using read_url directly on a known website URL.`;
 }
 
 async function readWebPage(targetUrl) {
@@ -217,7 +267,7 @@ async function queryDeepSeek(prompt, historyKey, modelOverride, effortOverride) 
   const reasoningEffort = effortOverride || DEFAULT_REASONING_EFFORT;
 
   // Build strictly alternating messages
-  const messages = [{ role: 'system', content: SYSTEM_PROMPT }];
+  const messages = [{ role: 'system', content: getSystemPrompt() }];
   for (const msg of history) {
     const prev = messages[messages.length - 1];
     if (prev && prev.role === msg.role) {
@@ -236,15 +286,19 @@ async function queryDeepSeek(prompt, historyKey, modelOverride, effortOverride) 
 
   let combinedReasoning = '';
   let choice = null;
+  const MAX_TOOL_STEPS = 7;
 
-  for (let step = 0; step < 4; step++) {
+  for (let step = 0; step <= MAX_TOOL_STEPS; step++) {
+    const isFinalStep = step === MAX_TOOL_STEPS;
     const payload = {
       model,
       messages,
       reasoning_effort: reasoningEffort,
-      tools: TOOLS,
       stream: false,
     };
+    if (!isFinalStep) {
+      payload.tools = TOOLS;
+    }
 
     let data;
     try {
@@ -432,9 +486,10 @@ function createBotClient(includeMessageContentIntent = true) {
     partials: [Partials.Channel, Partials.Message],
   });
 
-  client.once('ready', async (readyClient) => {
+  client.once(Events.ClientReady, async (readyClient) => {
     console.log(`[READY] Logged in as ${readyClient.user.tag}`);
     console.log(`[CONFIG] Base URL: ${DEEPSEEK_BASE_URL} | Default Model: ${DEFAULT_MODEL}`);
+    console.log('[TOOLS] Live Web Search (web_search & read_url) active');
     await registerSlashCommands(readyClient.user.id);
   });
 
@@ -448,7 +503,7 @@ function createBotClient(includeMessageContentIntent = true) {
       conversationHistory.delete(historyKey);
       await interaction.reply({
         content: 'Conversation history cleared!',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
