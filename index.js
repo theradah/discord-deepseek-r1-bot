@@ -30,7 +30,7 @@ const DEFAULT_REASONING_EFFORT = (
 ).trim();
 const SYSTEM_PROMPT =
   (process.env.SYSTEM_PROMPT || '').trim() ||
-  'You are a helpful, concise, and intelligent AI assistant on Discord powered by DeepSeek.';
+  'You are Ruth, a helpful, concise, and intelligent AI assistant on Discord running directly on the official DeepSeek API (api.deepseek.com). You are a DeepSeek model created by DeepSeek (never claim to be Claude or Anthropic). You have access to live web_search and read_url tools—use them whenever the user asks you to Google, search the web, verify current facts, or check a website.';
 
 const MAX_HISTORY_TURNS = 10;
 const DISCORD_MAX_LEN = 1900;
@@ -66,7 +66,151 @@ function appendHistory(key, userContent, assistantContent) {
   conversationHistory.set(key, history);
 }
 
+// --- Web Search & URL Reader Tools (Zero API Key Required) ---
+function decodeHtmlEntities(str) {
+  return (str || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ');
+}
+
+async function performWebSearch(query) {
+  try {
+    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      },
+    });
+    const html = await res.text();
+
+    const results = [];
+    const blockRegex =
+      /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
+    let match;
+    while ((match = blockRegex.exec(html)) !== null && results.length < 6) {
+      let href = match[1];
+      const uddgMatch = href.match(/[?&]uddg=([^&]+)/);
+      if (uddgMatch) {
+        href = decodeURIComponent(uddgMatch[1]);
+      }
+      const title = decodeHtmlEntities(match[2].replace(/<[^>]+>/g, '').trim());
+      const snippet = decodeHtmlEntities(match[3].replace(/<[^>]+>/g, '').trim());
+      if (title && href) {
+        results.push({ title, url: href, snippet });
+      }
+    }
+
+    if (results.length === 0) {
+      return `No direct search results found for "${query}".`;
+    }
+
+    return results
+      .map((r, i) => `[${i + 1}] ${r.title}\nURL: ${r.url}\nSnippet: ${r.snippet}`)
+      .join('\n\n');
+  } catch (err) {
+    return `Web search error: ${err.message}`;
+  }
+}
+
+async function readWebPage(targetUrl) {
+  try {
+    const jinaUrl = `https://r.jina.ai/${targetUrl}`;
+    const res = await fetch(jinaUrl, {
+      headers: {
+        Accept: 'text/plain',
+        'User-Agent': 'Discord-DeepSeek-Bot/1.0',
+      },
+    });
+    if (res.ok) {
+      const text = await res.text();
+      return text.slice(0, 12000);
+    }
+
+    const rawRes = await fetch(targetUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+      },
+    });
+    const html = await rawRes.text();
+    const cleaned = decodeHtmlEntities(
+      html
+        .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+    );
+    return cleaned.slice(0, 10000) || 'Could not extract readable text from page.';
+  } catch (err) {
+    return `Failed to read URL (${targetUrl}): ${err.message}`;
+  }
+}
+
+const TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'web_search',
+      description:
+        'Search the live web (via DuckDuckGo) for current events, facts, companies, research papers, or any topic the user asks to Google or look up.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: 'The search query string to look up on the web.',
+          },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_url',
+      description:
+        'Fetch and read the text content of a specific webpage URL (for example, a URL returned by web_search or shared by the user).',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: {
+            type: 'string',
+            description: 'The full http:// or https:// URL to read.',
+          },
+        },
+        required: ['url'],
+      },
+    },
+  },
+];
+
 // --- DeepSeek API Client ---
+async function callDeepSeekEndpoint(payload) {
+  const endpoint = `${DEEPSEEK_BASE_URL}/chat/completions`;
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    throw new Error(`DeepSeek API error (${response.status}): ${errText || response.statusText}`);
+  }
+
+  return response.json();
+}
+
 async function queryDeepSeek(prompt, historyKey, modelOverride, effortOverride) {
   const history = conversationHistory.get(historyKey) || [];
   const model = normalizeModel(modelOverride || DEFAULT_MODEL);
@@ -90,36 +234,80 @@ async function queryDeepSeek(prompt, historyKey, modelOverride, effortOverride) 
     messages.push({ role: 'user', content: prompt });
   }
 
-  const endpoint = `${DEEPSEEK_BASE_URL}/chat/completions`;
-  const payload = {
-    model,
-    messages,
-    reasoning_effort: reasoningEffort,
-    stream: false,
-  };
+  let combinedReasoning = '';
+  let choice = null;
 
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
-    },
-    body: JSON.stringify(payload),
-  });
+  for (let step = 0; step < 4; step++) {
+    const payload = {
+      model,
+      messages,
+      reasoning_effort: reasoningEffort,
+      tools: TOOLS,
+      stream: false,
+    };
 
-  if (!response.ok) {
-    const errText = await response.text().catch(() => '');
-    throw new Error(`DeepSeek API error (${response.status}): ${errText || response.statusText}`);
+    let data;
+    try {
+      data = await callDeepSeekEndpoint(payload);
+    } catch (err) {
+      // Fallback without tools if model/endpoint rejects tool definitions
+      if (step === 0 && String(err.message).toLowerCase().includes('tool')) {
+        delete payload.tools;
+        data = await callDeepSeekEndpoint(payload);
+      } else {
+        throw err;
+      }
+    }
+
+    choice = data.choices && data.choices[0] && data.choices[0].message;
+    if (!choice) {
+      throw new Error('Empty response received from DeepSeek API.');
+    }
+
+    if (choice.reasoning_content) {
+      combinedReasoning += (combinedReasoning ? '\n' : '') + choice.reasoning_content.trim();
+    }
+
+    if (!choice.tool_calls || choice.tool_calls.length === 0) {
+      break;
+    }
+
+    // Preserve reasoning_content during tool call sub-turns as required by DeepSeek Thinking Mode
+    messages.push({
+      role: 'assistant',
+      content: choice.content || '',
+      reasoning_content: choice.reasoning_content || '',
+      tool_calls: choice.tool_calls,
+    });
+
+    for (const toolCall of choice.tool_calls) {
+      const fnName = toolCall.function && toolCall.function.name;
+      let args = {};
+      try {
+        args = JSON.parse((toolCall.function && toolCall.function.arguments) || '{}');
+      } catch (_) {}
+
+      let toolOutput = '';
+      if (fnName === 'web_search') {
+        console.log(`[TOOL] web_search: "${args.query}"`);
+        toolOutput = await performWebSearch(args.query || prompt);
+      } else if (fnName === 'read_url') {
+        console.log(`[TOOL] read_url: "${args.url}"`);
+        toolOutput = await readWebPage(args.url || '');
+      } else {
+        toolOutput = `Unknown tool: ${fnName}`;
+      }
+
+      messages.push({
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        content: toolOutput,
+      });
+    }
   }
 
-  const data = await response.json();
-  const choice = data.choices && data.choices[0] && data.choices[0].message;
-  if (!choice) {
-    throw new Error('Empty response received from DeepSeek API.');
-  }
-
-  const answer = (choice.content || '').trim() || '*(No response content)*';
-  const reasoning = (choice.reasoning_content || '').trim();
+  const answer = (choice && choice.content ? choice.content : '').trim() || '*(No response content)*';
+  const reasoning = combinedReasoning.trim();
 
   appendHistory(historyKey, prompt, answer);
 
