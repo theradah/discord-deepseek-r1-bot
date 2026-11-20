@@ -36,10 +36,14 @@ const BASE_SYSTEM_PROMPT =
 
 function getSystemPrompt() {
   const nowStr = new Date().toISOString().split('T')[0];
-  return `${BASE_SYSTEM_PROMPT}\nToday's real current date is ${nowStr} (year 2026). Dates in 2025 and 2026 on websites are real, current dates—not a simulation.`;
+  return (
+    `${BASE_SYSTEM_PROMPT}\n` +
+    `Today's real current date is ${nowStr} (year 2026). Dates in 2025 and 2026 on websites are real, current dates—not a simulation.\n` +
+    `Multi-user chat rules: Each user message begins with a header like "[Message from DisplayName (@username, ID: ...)]" (and optionally "[Replying to ...]"). Use this header to differentiate between users, know who sent each message in the conversation history, and refer to users accurately. Do not repeat the "[Message from ...]" tag in your own response.`
+  );
 }
 
-const MAX_HISTORY_TURNS = 10;
+const MAX_HISTORY_TURNS = 15;
 const DISCORD_MAX_LEN = 1900;
 
 if (!DISCORD_TOKEN) {
@@ -51,12 +55,27 @@ if (!DEEPSEEK_API_KEY) {
   process.exit(1);
 }
 
-// Per-channel/user conversation history and selected model
+// Per-channel conversation history (shared across users with speaker tags) and selected model
 const conversationHistory = new Map();
 const channelModels = new Map();
 
-function getHistoryKey(channelId, userId) {
-  return `${channelId}:${userId}`;
+function getHistoryKey(channelId) {
+  return `${channelId}`;
+}
+
+function formatUserPrompt(user, member, rawPrompt, replyContext = '') {
+  const username = (user && user.username) || 'unknown';
+  const displayName =
+    (member && member.displayName) ||
+    (user && (user.globalName || user.username)) ||
+    username;
+  const userId = (user && user.id) || 'unknown';
+  const speakerLabel =
+    displayName !== username
+      ? `${displayName} (@${username}, ID: ${userId})`
+      : `@${username} (ID: ${userId})`;
+  const replyLine = replyContext ? `\n[Replying to ${replyContext}]` : '';
+  return `[Message from ${speakerLabel}]${replyLine}:\n${rawPrompt}`;
 }
 
 function getModel(channelId) {
@@ -85,86 +104,35 @@ function decodeHtmlEntities(str) {
 }
 
 async function performWebSearch(query) {
-  // 1. Try Jina Web Search reader first (works reliably from cloud datacenter IPs)
-  try {
-    const jinaSearchUrl = `https://s.jina.ai/${encodeURIComponent(query)}`;
-    const jinaRes = await fetch(jinaSearchUrl, {
-      headers: {
-        Accept: 'text/plain',
-        'X-Retain-Images': 'none',
-        'User-Agent': 'Discord-DeepSeek-Bot/1.0',
-      },
-    });
-    if (jinaRes.ok) {
-      const text = (await jinaRes.text()).trim();
-      if (text && text.length > 80 && !text.startsWith('{"data":null')) {
-        return text.slice(0, 10000);
+  const searchTargets = [
+    `https://r.jina.ai/https://search.yahoo.com/search?p=${encodeURIComponent(query)}`,
+    `https://r.jina.ai/https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`,
+    `https://s.jina.ai/${encodeURIComponent(query)}`,
+  ];
+
+  for (const target of searchTargets) {
+    try {
+      const res = await fetch(target, {
+        headers: {
+          Accept: 'text/plain',
+          'X-Retain-Images': 'none',
+          'User-Agent': 'Discord-DeepSeek-Bot/1.0',
+        },
+      });
+      if (res.ok) {
+        const text = (await res.text()).trim();
+        const isBotChallenge =
+          text.includes('Unfortunately, bots use DuckDuckGo') ||
+          text.includes('AuthenticationRequiredError') ||
+          text.startsWith('{"data":null');
+        if (text && text.length > 120 && !isBotChallenge) {
+          return text.slice(0, 10000);
+        }
       }
-    }
-  } catch (_) {}
-
-  // 2. Try DuckDuckGo HTML search with tolerant regexes
-  try {
-    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      },
-    });
-    const html = await res.text();
-
-    const results = [];
-    const linkRegex = /<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-    const snippetRegex = /<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
-
-    const links = [];
-    let m;
-    while ((m = linkRegex.exec(html)) !== null && links.length < 8) {
-      let href = m[1];
-      const uddgMatch = href.match(/[?&]uddg=([^&]+)/);
-      if (uddgMatch) href = decodeURIComponent(uddgMatch[1]);
-      const title = decodeHtmlEntities(m[2].replace(/<[^>]+>/g, '').trim());
-      links.push({ title, url: href });
-    }
-
-    const snippets = [];
-    while ((m = snippetRegex.exec(html)) !== null && snippets.length < 8) {
-      snippets.push(decodeHtmlEntities(m[1].replace(/<[^>]+>/g, '').trim()));
-    }
-
-    for (let i = 0; i < links.length; i++) {
-      if (links[i].title && links[i].url) {
-        results.push({
-          title: links[i].title,
-          url: links[i].url,
-          snippet: snippets[i] || '',
-        });
-      }
-    }
-
-    if (results.length > 0) {
-      return results
-        .map((r, i) => `[${i + 1}] ${r.title}\nURL: ${r.url}\nSnippet: ${r.snippet}`)
-        .join('\n\n');
-    }
-  } catch (_) {}
-
-  // 3. Fallback: Read DuckDuckGo Lite via Jina Reader
-  try {
-    const ddgJina = `https://r.jina.ai/https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
-    const res = await fetch(ddgJina, {
-      headers: { Accept: 'text/plain', 'User-Agent': 'Discord-DeepSeek-Bot/1.0' },
-    });
-    if (res.ok) {
-      const text = (await res.text()).trim();
-      if (text.length > 50) return text.slice(0, 10000);
-    }
-  } catch (err) {
-    return `Web search error: ${err.message}`;
+    } catch (_) {}
   }
 
-  return `No search results found for "${query}". Try using read_url directly on a known website URL.`;
+  return `Search engine blocked datacenter query for "${query}". Please use the read_url tool directly on the relevant website URL (e.g., https://pangram.com or https://en.wikipedia.org/wiki/...).`;
 }
 
 async function readWebPage(targetUrl) {
@@ -497,12 +465,12 @@ function createBotClient(includeMessageContentIntent = true) {
   client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
-    const historyKey = getHistoryKey(interaction.channelId, interaction.user.id);
+    const historyKey = getHistoryKey(interaction.channelId);
 
     if (interaction.commandName === 'reset') {
       conversationHistory.delete(historyKey);
       await interaction.reply({
-        content: 'Conversation history cleared!',
+        content: 'Conversation history cleared for this channel!',
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -518,14 +486,24 @@ function createBotClient(includeMessageContentIntent = true) {
     }
 
     if (interaction.commandName === 'ask') {
-      const prompt = interaction.options.getString('prompt', true);
+      const rawPrompt = interaction.options.getString('prompt', true);
+      const attributedPrompt = formatUserPrompt(
+        interaction.user,
+        interaction.member,
+        rawPrompt
+      );
       const modelChoice =
         interaction.options.getString('model', false) || getModel(interaction.channelId);
       const thinkingChoice = interaction.options.getString('thinking', false) || undefined;
 
       await interaction.deferReply();
       try {
-        const result = await queryDeepSeek(prompt, historyKey, modelChoice, thinkingChoice);
+        const result = await queryDeepSeek(
+          attributedPrompt,
+          historyKey,
+          modelChoice,
+          thinkingChoice
+        );
         const formatted = formatResponse(result);
         const chunks = splitMessage(formatted);
 
@@ -548,20 +526,29 @@ function createBotClient(includeMessageContentIntent = true) {
     const isMentioned = message.mentions.has(client.user.id);
     const rawContent = (message.content || '').trim();
 
-    if (!rawContent && !isMentioned) return;
+    let referencedMsg = null;
+    let isReplyToBot = false;
+    if (message.reference && message.reference.messageId) {
+      referencedMsg = await message.fetchReference().catch(() => null);
+      if (referencedMsg && referencedMsg.author && referencedMsg.author.id === client.user.id) {
+        isReplyToBot = true;
+      }
+    }
 
-    const historyKey = getHistoryKey(message.channel.id, message.author.id);
+    if (!rawContent && !isMentioned && !isReplyToBot) return;
+
+    const historyKey = getHistoryKey(message.channel.id);
 
     if (rawContent.toLowerCase() === '!reset') {
       conversationHistory.delete(historyKey);
-      await message.reply('Conversation history cleared!');
+      await message.reply('Conversation history cleared for this channel!');
       return;
     }
 
     let prompt = '';
     if (rawContent.toLowerCase().startsWith('!ask ')) {
       prompt = rawContent.slice(5).trim();
-    } else if (isMentioned) {
+    } else if (isMentioned || isReplyToBot) {
       prompt = rawContent.replace(new RegExp(`<@!?${client.user.id}>`, 'g'), '').trim();
     } else if (isDM) {
       prompt = rawContent;
@@ -571,10 +558,43 @@ function createBotClient(includeMessageContentIntent = true) {
 
     if (!prompt) {
       await message.reply(
-        'Hello! Mention me with a question, send me a DM, or use `/ask` to chat with DeepSeek!'
+        'Hello! Mention me with a question, reply to me, send me a DM, or use `/ask` to chat with DeepSeek!'
       );
       return;
     }
+
+    // Replace raw <@userId> mentions of other users with readable names
+    prompt = prompt.replace(/<@!?(\d+)>/g, (full, id) => {
+      const mentionedMember = message.mentions.members && message.mentions.members.get(id);
+      const mentionedUser = message.mentions.users && message.mentions.users.get(id);
+      if (mentionedMember) {
+        return `@${mentionedMember.displayName} (@${mentionedMember.user.username})`;
+      }
+      if (mentionedUser) {
+        return `@${mentionedUser.globalName || mentionedUser.username} (@${mentionedUser.username})`;
+      }
+      return full;
+    });
+
+    let replyContext = '';
+    if (referencedMsg && referencedMsg.author) {
+      const refUser = referencedMsg.author;
+      const refName =
+        (referencedMsg.member && referencedMsg.member.displayName) ||
+        refUser.globalName ||
+        refUser.username;
+      const refSnippet = (referencedMsg.content || '').trim().slice(0, 350);
+      if (refSnippet) {
+        replyContext = `${refName} (@${refUser.username}): "${refSnippet}"`;
+      }
+    }
+
+    const attributedPrompt = formatUserPrompt(
+      message.author,
+      message.member,
+      prompt,
+      replyContext
+    );
 
     try {
       if (message.channel.sendTyping) {
@@ -588,7 +608,7 @@ function createBotClient(includeMessageContentIntent = true) {
 
       let result;
       try {
-        result = await queryDeepSeek(prompt, historyKey, getModel(message.channel.id));
+        result = await queryDeepSeek(attributedPrompt, historyKey, getModel(message.channel.id));
       } finally {
         clearInterval(typingInterval);
       }
